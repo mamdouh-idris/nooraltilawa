@@ -5,6 +5,10 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.net.Uri
 import android.os.Bundle
 import android.view.Gravity
@@ -16,6 +20,7 @@ import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -31,12 +36,18 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.webkit.WebViewAssetLoader
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private lateinit var webView: WebView
     private lateinit var progressBar: ProgressBar
     private lateinit var errorOverlay: LinearLayout
+    private var sensorManager: SensorManager? = null
+    private var accelerometer: Sensor? = null
+    private var wasScreenFacingUp = false
+    private var lastFlipEventAt = 0L
+    private lateinit var assetLoader: WebViewAssetLoader
     private var pendingWebPermissionRequest: PermissionRequest? = null
     private var pendingGeoOrigin: String? = null
     private var pendingGeoCallback: GeolocationPermissions.Callback? = null
@@ -64,8 +75,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
-        private const val TARGET_URL = "https://noor-tilawa-wurn.whacka.app/#/read"
-        private const val ALLOWED_HOST = "noor-tilawa-wurn.whacka.app"
+        private const val TARGET_URL = "https://appassets.androidplatform.net/index.html?mode=app"
+        private const val ALLOWED_HOST = "appassets.androidplatform.net"
         private const val THEME_HEX = "#061412"
         private const val APP_TITLE = "نور التلاوة"
         private const val FONT_FAMILY = "Amiri"
@@ -74,6 +85,11 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        sensorManager = getSystemService(SENSOR_SERVICE) as? SensorManager
+        accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        assetLoader = WebViewAssetLoader.Builder()
+            .addPathHandler("/", WebViewAssetLoader.AssetsPathHandler(this))
+            .build()
 
         val themeColorInt = Color.parseColor(THEME_HEX)
         window.statusBarColor = themeColorInt
@@ -190,6 +206,17 @@ class MainActivity : AppCompatActivity() {
         }
 
         webView.webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(
+                view: WebView?,
+                request: WebResourceRequest?
+            ): WebResourceResponse? {
+                val url = request?.url ?: return null
+                if (url.host?.lowercase() == "appassets.androidplatform.net") {
+                    val response = assetLoader.shouldInterceptRequest(url)
+                    return fixMimeType(url.toString(), response)
+                }
+                return null
+            }
             override fun shouldOverrideUrlLoading(
                 view: WebView?,
                 request: WebResourceRequest?
@@ -201,7 +228,7 @@ class MainActivity : AppCompatActivity() {
                     return true
                 }
                 val host = uri.host?.lowercase() ?: ""
-                if (host == ALLOWED_HOST || host.endsWith(".$ALLOWED_HOST")) {
+                if (host == ALLOWED_HOST || host.endsWith(".$ALLOWED_HOST") || host == "appassets.androidplatform.net") {
                     return false
                 }
                 openExternalUri(uri)
@@ -210,21 +237,6 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-                val js = """
-                    (function(){
-                      if(!document.getElementById('noor-custom-font')){
-                        var l=document.createElement('link');
-                        l.id='noor-custom-font';
-                        l.rel='stylesheet';
-                        l.href='https://fonts.googleapis.com/css2?family=Amiri:wght@400;600;700&display=swap';
-                        document.head.appendChild(l);
-                        var s=document.createElement('style');
-                        s.textContent="body,p,span,h1,h2,h3,button{font-family:'" + FONT_FAMILY + "',sans-serif !important;}";
-                        document.head.appendChild(s);
-                      }
-                    })();
-                """.trimIndent()
-                view?.evaluateJavascript(js, null)
             }
 
             override fun onReceivedError(
@@ -341,14 +353,67 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         webView.onResume()
         webView.resumeTimers()
+        accelerometer?.let {
+            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+        }
     }
 
     override fun onPause() {
+        sensorManager?.unregisterListener(this)
         // Keep WebView audio/radio stream active while navigating or screen locks
         super.onPause()
     }
 
+    override fun onSensorChanged(event: SensorEvent?) {
+        val e = event ?: return
+        if (e.sensor.type != Sensor.TYPE_ACCELEROMETER) return
+        val z = e.values[2]
+        if (z > 2.5f) {
+            wasScreenFacingUp = true
+        } else if (wasScreenFacingUp && z < -7.0f) {
+            val nowMs = System.currentTimeMillis()
+            if (nowMs - lastFlipEventAt > 1200L) {
+                lastFlipEventAt = nowMs
+                wasScreenFacingUp = false
+                runOnUiThread {
+                    webView.evaluateJavascript(
+                        "window.dispatchEvent(new CustomEvent('noor-phone-flipped'));",
+                        null
+                    )
+                }
+            }
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+        // No-op
+    }
+
+    private fun fixMimeType(urlString: String, response: WebResourceResponse?): WebResourceResponse? {
+        if (response == null) return null
+        val cleanUrl = urlString.substringBefore('?').substringBefore('#').lowercase()
+        val mime = when {
+            cleanUrl.endsWith(".js") || cleanUrl.endsWith(".mjs") -> "application/javascript"
+            cleanUrl.endsWith(".css") -> "text/css"
+            cleanUrl.endsWith(".html") || cleanUrl.endsWith(".htm") -> "text/html"
+            cleanUrl.endsWith(".json") -> "application/json"
+            cleanUrl.endsWith(".png") -> "image/png"
+            cleanUrl.endsWith(".jpg") || cleanUrl.endsWith(".jpeg") || cleanUrl.endsWith(".jfif") -> "image/jpeg"
+            cleanUrl.endsWith(".svg") -> "image/svg+xml"
+            cleanUrl.endsWith(".woff2") -> "font/woff2"
+            cleanUrl.endsWith(".woff") -> "font/woff"
+            cleanUrl.endsWith(".ttf") -> "font/ttf"
+            cleanUrl.endsWith(".ico") -> "image/x-icon"
+            else -> null
+        }
+        if (mime != null) {
+            response.mimeType = mime
+        }
+        return response
+    }
+
     override fun onDestroy() {
+        sensorManager?.unregisterListener(this)
         webView.destroy()
         super.onDestroy()
     }
